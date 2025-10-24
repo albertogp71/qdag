@@ -1,55 +1,20 @@
+# dag_tensorflow_qubits.py
 """
-dag_tensorflow.py
+DAG module using TensorFlow where:
+- Source nodes: 0 incoming, 1 outgoing; each source holds a 2-vector (pair of complex numbers)
+  whose squared-modulus sum equals 1 (normalised).
+- Sink nodes: 1 incoming, 0 outgoing. Number of sources == number of sinks.
+- Inner nodes: k incoming and k outgoing. Each inner node has a complex square matrix of shape
+  (2**k, 2**k). Incoming edge vectors are Kronecker-multiplied (in the order edges were added)
+  into a column vector of length 2**k, multiplied by the matrix, giving an output vector of length
+  2**k. That output vector is assigned to every outgoing edge of the inner node.
 
-A small Python module that implements a directed acyclic graph (DAG) where:
-- Source nodes: 1 outgoing edge, 0 incoming edges. Each source has an initializer value.
-- Sink nodes: 1 incoming edge, 0 outgoing edges.
-- Inner nodes: same number of incoming and outgoing edges (call it n). Each inner node
-  has a square complex matrix of shape (n, n). The multiplication mapping incoming
-  column vector -> outgoing column vector is `out = matrix @ in`.
-
-This implementation uses TensorFlow tensors/variables and matrix operations. It
-is implemented to be easy to use in eager mode and also supports decorating
-`simulate` with `tf.function` for speed.
-
-Example (short):
-    from dag_tensorflow import Graph, SourceNode, InnerNode, SinkNode
-    import tensorflow as tf
-
-    g = Graph(dtype=tf.complex128)
-    s1 = g.add_source('s1')
-    s2 = g.add_source('s2')
-    a = g.add_inner('A', degree=2)
-    t = g.add_sink('t')
-
-    # build edges (ordering matters for matrix rows/cols)
-    g.add_edge('s1', 'A')   # this will be one of A's incoming edges
-    g.add_edge('s2', 'A')   # second incoming
-    g.add_edge('A', 't')    # A must have 2 outgoing edges; to satisfy degree=2
-    g.add_edge('A', 't')    # (you may connect to the same sink multiple times if graph requires)
-
-    # set A's matrix explicitly or rely on random initialization
-    g.set_inner_matrix('A', tf.eye(2, dtype=tf.complex128))
-
-    # initialize sources
-    g.initialize_sources({'s1': 1+0j, 's2': 2+0j})
-
-    # run simulation: this propagates source values along edges and applies inner matrices
-    g.simulate()
-
-    # inspect edge values
-    print(g.get_edge_values())
-
-Note: The graph is validated at `graph.validate()`; it checks the structural
-constraints described above and raises informative errors if the constraints are
-violated.
-
+Edges carry 1-D tensors (tf.Tensor) of arbitrary length; the module uses tf.complex128 by default.
 """
 
 from __future__ import annotations
-
+from typing import Any, Dict, List, Optional
 import tensorflow as tf
-from typing import Any, Dict, List, Optional, Sequence
 
 
 class GraphError(Exception):
@@ -57,27 +22,31 @@ class GraphError(Exception):
 
 
 class Edge:
-    """Directed edge carrying a complex scalar tensor value."""
+    """Directed edge carrying a 1-D tf.Tensor (complex) as its current value."""
 
     def __init__(self, name: str, start: "Node", end: "Node", dtype=tf.complex128):
         self.name = name
         self.start = start
         self.end = end
-        # scalar complex variable holding the current value on this edge
         self.dtype = dtype
-        self.value = tf.Variable(tf.cast(0, dtype=self.dtype), trainable=False)
+        # store a 1-D tf.Tensor (initially zero scalar vector)
+        self.value: tf.Tensor = tf.convert_to_tensor([0], dtype=self.dtype)
 
     def set_value(self, v: Any):
+        """Set the edge's tensor value (accepts python/numpy/tf types)."""
         t = tf.convert_to_tensor(v, dtype=self.dtype)
-        # allow scalar shapes only
-        t = tf.reshape(t, [])
-        self.value.assign(t)
+        # Ensure 1-D vector
+        if tf.rank(t) == 0:
+            t = tf.reshape(t, [1])
+        else:
+            t = tf.reshape(t, [-1])
+        self.value = tf.identity(t)
 
     def get_value(self) -> tf.Tensor:
         return tf.identity(self.value)
 
     def __repr__(self) -> str:
-        return f"Edge({self.name}: {self.start.name}->{self.end.name}, value={self.value.numpy()})"
+        return f"Edge({self.name}: {self.start.name}->{self.end.name}, shape={tuple(self.value.shape)})"
 
 
 class Node:
@@ -86,7 +55,7 @@ class Node:
         self.in_edges: List[Edge] = []
         self.out_edges: List[Edge] = []
 
-    def __repr__(self) -> str:
+    def __repr__(self):
         return f"Node({self.name})"
 
 
@@ -94,19 +63,26 @@ class SourceNode(Node):
     def __init__(self, name: str, dtype=tf.complex128):
         super().__init__(name)
         self.dtype = dtype
-        # scalar value assigned by initializer
-        self._value = tf.Variable(tf.cast(0, dtype=self.dtype), trainable=False)
+        # store a length-2 tf.Tensor representing the pair of complex values (normalized)
+        self._value: tf.Tensor = tf.convert_to_tensor([0, 0], dtype=self.dtype)
 
-    def set_value(self, v: Any):
-        t = tf.convert_to_tensor(v, dtype=self.dtype)
-        t = tf.reshape(t, [])
-        self._value.assign(t)
+    def set_value(self, pair: Any):
+        t = tf.convert_to_tensor(pair, dtype=self.dtype)
+        t = tf.reshape(t, [-1])
+        if t.shape[0] != 2:
+            raise GraphError(f"Source {self.name} initializer must be a pair (length 2), got shape {t.shape}")
+        # check normalization: sum of squared moduli equals 1 (within tolerance)
+        mod_sq = tf.reduce_sum(tf.math.real(tf.math.conj(t) * t))
+        # allow small numeric tolerance
+        if not tf.math.abs(mod_sq - tf.constant(1.0, dtype=mod_sq.dtype)) < tf.constant(1e-8, dtype=mod_sq.dtype):
+            raise GraphError(f"Source {self.name} initializer must be normalized: sum|v|^2 == 1 (got {mod_sq.numpy()})")
+        self._value = tf.identity(t)
 
     def get_value(self) -> tf.Tensor:
         return tf.identity(self._value)
 
-    def __repr__(self) -> str:
-        return f"SourceNode({self.name}, value={self._value.numpy()})"
+    def __repr__(self):
+        return f"SourceNode({self.name}, value_shape={tuple(self._value.shape)})"
 
 
 class SinkNode(Node):
@@ -115,44 +91,40 @@ class SinkNode(Node):
 
 
 class InnerNode(Node):
-    def __init__(self, name: str, degree: int, matrix: Optional[tf.Tensor] = None, dtype=tf.complex128):
+    def __init__(self, name: str, degree: int, matrix: Optional[Any] = None, dtype=tf.complex128):
         """
-        Inner node with `degree` incoming and `degree` outgoing edges.
-
-        Parameters
-        ----------
-        name: identifier
-        degree: number of incoming/outgoing edges
-        matrix: optional initial square matrix (degree x degree). If omitted,
-                the matrix is initialized randomly.
-        dtype: tensorflow dtype (tf.complex64 or tf.complex128 recommended)
+        degree = number of incoming (and outgoing) edges = k
+        matrix: optional (2**k, 2**k) complex matrix; if omitted, random complex init used.
         """
         super().__init__(name)
         if degree <= 0:
             raise ValueError("degree must be positive")
         self.degree = degree
         self.dtype = dtype
+        size = 2 ** degree
         if matrix is not None:
-            mat = tf.convert_to_tensor(matrix, dtype=self.dtype)
-            mat = tf.reshape(mat, (degree, degree))
-            self.matrix = tf.Variable(mat, trainable=False)
+            m = tf.convert_to_tensor(matrix, dtype=self.dtype)
+            m = tf.reshape(m, (size, size))
+            self.matrix = tf.identity(m)
         else:
-            # random complex initialization: real and imag normal(0, 0.1)
-            real = tf.random.normal((degree, degree), stddev=0.1, dtype=tf.float64 if self.dtype==tf.complex128 else tf.float32)
-            imag = tf.random.normal((degree, degree), stddev=0.1, dtype=tf.float64 if self.dtype==tf.complex128 else tf.float32)
+            # random complex init: small gaussian real+imag
+            float_dtype = tf.float64 if self.dtype == tf.complex128 else tf.float32
+            real = tf.random.normal((size, size), stddev=0.1, dtype=float_dtype)
+            imag = tf.random.normal((size, size), stddev=0.1, dtype=float_dtype)
             comp = tf.complex(real, imag)
-            self.matrix = tf.Variable(tf.cast(comp, dtype=self.dtype), trainable=False)
+            self.matrix = tf.identity(tf.cast(comp, dtype=self.dtype))
 
     def set_matrix(self, mat: Any):
+        size = 2 ** self.degree
         m = tf.convert_to_tensor(mat, dtype=self.dtype)
-        m = tf.reshape(m, (self.degree, self.degree))
-        self.matrix.assign(m)
+        m = tf.reshape(m, (size, size))
+        self.matrix = tf.identity(m)
 
     def get_matrix(self) -> tf.Tensor:
         return tf.identity(self.matrix)
 
-    def __repr__(self) -> str:
-        return f"InnerNode({self.name}, degree={self.degree})"
+    def __repr__(self):
+        return f"InnerNode({self.name}, degree={self.degree}, matrix_shape={tuple(self.matrix.shape)})"
 
 
 class Graph:
@@ -162,24 +134,23 @@ class Graph:
         self.edges: List[Edge] = []
         self._edge_counter = 0
 
-    # node creation helpers
     def add_source(self, name: str) -> SourceNode:
         if name in self.nodes:
-            raise GraphError(f"Node with name {name} already exists")
+            raise GraphError(f"Node {name} already exists")
         s = SourceNode(name, dtype=self.dtype)
         self.nodes[name] = s
         return s
 
     def add_sink(self, name: str) -> SinkNode:
         if name in self.nodes:
-            raise GraphError(f"Node with name {name} already exists")
+            raise GraphError(f"Node {name} already exists")
         s = SinkNode(name)
         self.nodes[name] = s
         return s
 
-    def add_inner(self, name: str, degree: int, matrix: Optional[tf.Tensor] = None) -> InnerNode:
+    def add_inner(self, name: str, degree: int, matrix: Optional[Any] = None) -> InnerNode:
         if name in self.nodes:
-            raise GraphError(f"Node with name {name} already exists")
+            raise GraphError(f"Node {name} already exists")
         n = InnerNode(name, degree=degree, matrix=matrix, dtype=self.dtype)
         self.nodes[name] = n
         return n
@@ -199,15 +170,10 @@ class Graph:
         self.edges.append(edge)
         return edge
 
-    def set_inner_matrix(self, node_name: str, matrix: Any):
-        n = self.nodes.get(node_name)
-        if not isinstance(n, InnerNode):
-            raise GraphError("set_inner_matrix applies only to InnerNode")
-        n.set_matrix(matrix)
-
     def initialize_sources(self, initializer: Dict[str, Any]):
         """
-        initializer: mapping from source node name -> scalar (Python complex, numeric, or tf tensor)
+        initializer: mapping source_name -> length-2 iterable (complex)
+        Each vector must be normalized (sum |v|^2 == 1).
         """
         for name, val in initializer.items():
             if name not in self.nodes:
@@ -217,16 +183,25 @@ class Graph:
                 raise GraphError(f"Node {name} is not a SourceNode")
             node.set_value(val)
 
+    def set_inner_matrix(self, node_name: str, matrix: Any):
+        n = self.nodes.get(node_name)
+        if not isinstance(n, InnerNode):
+            raise GraphError("set_inner_matrix applies only to InnerNode")
+        n.set_matrix(matrix)
+
     def validate(self):
-        """Validate graph constraints described in the module docstring."""
-        # Check node counts and degrees
+        # structural checks
+        source_count = 0
+        sink_count = 0
         for name, node in self.nodes.items():
             if isinstance(node, SourceNode):
+                source_count += 1
                 if len(node.in_edges) != 0:
                     raise GraphError(f"Source node {name} must have 0 incoming edges")
                 if len(node.out_edges) != 1:
                     raise GraphError(f"Source node {name} must have exactly 1 outgoing edge (has {len(node.out_edges)})")
             elif isinstance(node, SinkNode):
+                sink_count += 1
                 if len(node.out_edges) != 0:
                     raise GraphError(f"Sink node {name} must have 0 outgoing edges")
                 if len(node.in_edges) != 1:
@@ -236,19 +211,22 @@ class Graph:
                     raise GraphError(f"Inner node {name} expected {node.degree} incoming edges but found {len(node.in_edges)}")
                 if len(node.out_edges) != node.degree:
                     raise GraphError(f"Inner node {name} expected {node.degree} outgoing edges but found {len(node.out_edges)}")
-                # matrix shapes
+                # matrix shape
+                expected = 2 ** node.degree
                 mat = node.get_matrix()
-                if mat.shape != (node.degree, node.degree):
-                    raise GraphError(f"Inner node {name} matrix shape must be ({node.degree},{node.degree})")
+                if tuple(mat.shape) != (expected, expected):
+                    raise GraphError(f"Inner node {name} matrix shape must be ({expected},{expected})")
             else:
                 raise GraphError(f"Unknown node type for {name}")
 
-        # Optional: check acyclicity by topological sort
+        if source_count != sink_count:
+            raise GraphError(f"Number of sources ({source_count}) must equal number of sinks ({sink_count})")
+
+        # acyclicity check (Kahn)
         if not self._is_acyclic():
             raise GraphError("Graph must be acyclic")
 
     def _is_acyclic(self) -> bool:
-        # Kahn's algorithm on node names
         indeg = {name: len(n.in_edges) for name, n in self.nodes.items()}
         Q = [name for name, d in indeg.items() if d == 0]
         visited = 0
@@ -262,104 +240,142 @@ class Graph:
                     Q.append(e.end.name)
         return visited == len(self.nodes)
 
-    @tf.function
-    def _propagate_inner(self, matrices: Sequence[tf.Tensor], in_vectors: Sequence[tf.Tensor], out_vars: Sequence[tf.Variable]):
-        """
-        Helper wrapped as tf.function to do batched matmul style propagation for inner nodes.
-        Not strictly necessary but helps performance on larger graphs. The sequences should
-        align in order.
-        """
-        for mat, inv, out_vs in zip(matrices, in_vectors, out_vars):
-            # inv is shape [n, 1]; mat is [n, n]
-            res = tf.matmul(mat, inv)  # shape [n, 1]
-            # assign each element to corresponding outgoing edge variable
-            # flatten to shape [n]
-            flat = tf.reshape(res, [-1])
-            for i in tf.range(tf.shape(flat)[0]):
-                out_vs[i].assign(flat[i])
+    @staticmethod
+    def _kron_list(vecs: List[tf.Tensor]) -> tf.Tensor:
+        """Compute Kronecker (tensor) product of a list of 1-D tensors in order.
+        Result is a 1-D tensor of length prod(len(v) for v in vecs)."""
+        if not vecs:
+            # by convention, kron of empty list is scalar 1
+            return tf.convert_to_tensor([1], dtype=vecs[0].dtype if vecs else tf.complex128)
+        res = tf.reshape(vecs[0], [-1])
+        for v in vecs[1:]:
+            a = tf.reshape(res, [-1])
+            b = tf.reshape(v, [-1])
+            # tensordot with axes=0 then flatten
+            t = tf.tensordot(a, b, axes=0)
+            res = tf.reshape(t, [-1])
+        return tf.cast(res, dtype=vecs[0].dtype)
 
     def simulate(self):
         """
-        Perform one step propagation:
-        - For each source node, set its outgoing edge value to the source initializer value
-        - For each inner node, gather incoming edge scalar values into a column vector (shape [n,1]),
-          compute matrix @ vector and set outgoing edges accordingly.
-
-        Graph must be validated prior to simulate() (call validate()).
+        One-step propagation:
+        - Validate graph.
+        - For each source, set its single outgoing edge to the source's 2-vector.
+        - For each inner node:
+            * collect incoming edge vectors (in the order they appear in node.in_edges)
+            * compute kronecker product -> column vector length 2**k
+            * compute output = matrix @ input_vector
+            * assign output vector (1-D) to every outgoing edge of that inner node
         """
-        # Validate first
         self.validate()
 
-        # 1) propagate sources directly to their single outgoing edge
+        # 1) propagate sources
         for node in self.nodes.values():
             if isinstance(node, SourceNode):
                 if node.out_edges:
-                    val = node.get_value()
-                    # set the single outgoing edge
+                    val = node.get_value()  # length-2
                     node.out_edges[0].set_value(val)
 
         # 2) propagate inner nodes
-        matrices = []
-        in_vectors = []
-        out_vars = []
         for node in self.nodes.values():
             if isinstance(node, InnerNode):
-                # gather incoming edge scalar tensors in the order edges were added
-                in_vals = [tf.reshape(e.get_value(), [1, 1]) for e in node.in_edges]
-                # build column vector shape [n, 1]
-                inv = tf.concat(in_vals, axis=0)
-                matrices.append(node.get_matrix())
-                in_vectors.append(inv)
-                # collect outgoing edge variable references in same ordering as out_edges
-                out_vars.append([e.value for e in node.out_edges])
+                # gather incoming vectors in order
+                in_vecs = []
+                for e in node.in_edges:
+                    v = e.get_value()
+                    # ensure 1-D
+                    v = tf.reshape(v, [-1])
+                    in_vecs.append(tf.cast(v, dtype=self.dtype))
+                # build kronecker product
+                joint = self._kron_list(in_vecs)  # 1-D length 2**k
+                joint_col = tf.reshape(joint, [-1, 1])  # column vector
+                # matmul
+                mat = node.get_matrix()
+                out_col = tf.matmul(mat, joint_col)  # shape (2**k, 1)
+                out_vec = tf.reshape(out_col, [-1])  # 1-D
+                # assign to every outgoing edge
+                for e in node.out_edges:
+                    e.set_value(out_vec)
 
-        # use tf.function helper to do matmul and assign
-        # However _propagate_inner expects python lists of tensors/vars, they will be traced
-        # We call without tf.function here so it works in eager, but helper is tf.function
-        # and will be used for the inner loop:
-        if matrices:
-            # call python-level helper that in turn calls tf.function per node
-            self._propagate_inner(matrices, in_vectors, out_vars)
+    def get_edge_values(self) -> Dict[str, tf.Tensor]:
+        """Return mapping edge_name -> tf.Tensor (copy)."""
+        return {e.name: tf.identity(e.get_value()) for e in self.edges}
 
-    def get_edge_values(self) -> Dict[str, complex]:
-        """Return a mapping edge_name -> python complex value (numpy scalar)."""
+    def get_edge_values_numpy(self) -> Dict[str, Any]:
+        """Return mapping edge_name -> numpy array / python complex array (for convenience)."""
         out = {}
         for e in self.edges:
-            # convert tensor scalar to python complex
-            v = e.get_value().numpy().item()
-            out[e.name] = v
+            try:
+                out[e.name] = e.get_value().numpy()
+            except Exception:
+                out[e.name] = None
         return out
 
     def get_node_summary(self) -> Dict[str, Dict[str, Any]]:
         d = {}
         for name, node in self.nodes.items():
             d[name] = {
-                'type': type(node).__name__,
-                'in': [e.name for e in node.in_edges],
-                'out': [e.name for e in node.out_edges]
+                "type": type(node).__name__,
+                "in": [e.name for e in node.in_edges],
+                "out": [e.name for e in node.out_edges]
             }
             if isinstance(node, InnerNode):
-                d[name]['degree'] = node.degree
+                d[name]["degree"] = node.degree
+                d[name]["matrix_shape"] = tuple(node.get_matrix().shape)
         return d
 
 
-# If run as script, demonstrate a small example
-if __name__ == '__main__':
-    # small self-test demonstration
+if __name__ == "__main__":
+    # Example usage / small self-test
+    # - Two sources s0 and s1 (each a 2-vector, normalized)
+    # - One inner node A with degree 2 (matrix 4x4)
+    # - One sink t (one incoming)
+    #
+    # Graph layout:
+    #   s0 --> A --
+    #             \\--> t (A has 2 outgoing edges; both go to t)
+    #   s1 --> A --
+    #
+    # Number sources == number sinks? We'll add one sink per source: here 2 sources -> 2 sinks;
+    # for a short example we connect both A outputs to the same sink name twice to satisfy
+    # "each sink must have exactly 1 incoming edge" constraint; in real usage sinks would be
+    # distinct nodes.
     g = Graph(dtype=tf.complex128)
-    s1 = g.add_source('s1')
-    s2 = g.add_source('s2')
-    A = g.add_inner('A', degree=2)
-    T = g.add_sink('t')
 
-    g.add_edge('s1', 'A')
-    g.add_edge('s2', 'A')
-    g.add_edge('A', 't')
-    g.add_edge('A', 't')
+    # add sources/sinks
+    s0 = g.add_source("s0")
+    s1 = g.add_source("s1")
+    t0 = g.add_sink("t0")
+    t1 = g.add_sink("t1")
 
-    # set inner matrix explicitly
-    g.set_inner_matrix('A', tf.constant([[1+0j, 0+0j], [0+0j, 2+0j]], dtype=tf.complex128))
-    g.initialize_sources({'s1': 1+0j, 's2': 3+0j})
+    # inner node degree 2 (2 incoming and 2 outgoing)
+    A = g.add_inner("A", degree=2)
+
+    # edges
+    g.add_edge("s0", "A")  # s0 -> A (incoming 0)
+    g.add_edge("s1", "A")  # s1 -> A (incoming 1)
+    g.add_edge("A", "t0")  # A outgoing 0 -> t0
+    g.add_edge("A", "t1")  # A outgoing 1 -> t1
+
+    # set matrix for A: identity 4x4
+    g.set_inner_matrix("A", tf.eye(4, dtype=tf.complex128))
+
+    # init sources: normalized 2-vectors
+    g.initialize_sources({
+        "s0": [1.0 + 0.0j, 0.0 + 0.0j],  # |0>
+        "s1": [0.0 + 0.0j, 1.0 + 0.0j],  # |1>
+    })
+
+    # run simulation
     g.simulate()
-    print('Edges:', g.get_edge_values())
-    print('Nodes:', g.get_node_summary())
+
+    # print edge values as numpy arrays
+    ev = g.get_edge_values_numpy()
+    print("Edge values (numpy):")
+    for k, v in ev.items():
+        print(k, v)
+
+    # node summary
+    print("\nNode summary:")
+    import pprint
+    pprint.pprint(g.get_node_summary())
